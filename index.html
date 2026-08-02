@@ -143,6 +143,18 @@ const GripIcon = () => (
   </svg>
 );
 
+// ─── Constants ───────────────────────────────────────────────────────────────
+const EQ_PRESETS = [
+  { name:'Flat',    b:0,  m:0,  t:0  },
+  { name:'Bass+',   b:6,  m:-2, t:0  },
+  { name:'Vocal',   b:-2, m:5,  t:1  },
+  { name:'Treble+', b:0,  m:-1, t:6  },
+  { name:'Pop',     b:3,  m:3,  t:3  },
+  { name:'Rock',    b:5,  m:0,  t:3  },
+];
+const SPEEDS   = [0.5, 0.75, 1, 1.25, 1.5, 2];
+const SLEEP_OPTS = [0, 15, 30, 45, 60]; // 0 = off
+
 // ─── Component ────────────────────────────────────────────────────────────────
 function MusicPlayer() {
   // Library & Playback
@@ -197,6 +209,17 @@ function MusicPlayer() {
   const [headphoneOnly, setHeadphoneOnly]           = useState(false);
   const [headphonesDetected, setHeadphonesDetected] = useState(null);
 
+  // Live-EQ (applied to main audio in real-time)
+  const [liveEqEnabled, setLiveEqEnabled] = useState(false);
+  const [liveEqBass, setLiveEqBass]       = useState(0);
+  const [liveEqMid, setLiveEqMid]         = useState(0);
+  const [liveEqTreble, setLiveEqTreble]   = useState(0);
+
+  // Playback extras
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [sleepMinutes, setSleepMinutes]   = useState(0);   // 0 = off
+  const [sleepRemaining, setSleepRemaining] = useState(null); // seconds
+
   // Refs
   const audioRef         = useRef(null);
   const fileInputRef     = useRef(null);
@@ -220,6 +243,15 @@ function MusicPlayer() {
   const commitDragRef    = useRef(null);
   const goNextRef        = useRef(null);
   const goPrevRef        = useRef(null);
+  // Live-EQ
+  const liveAudioCtxRef  = useRef(null);
+  const liveBassRef      = useRef(null);
+  const liveMidRef       = useRef(null);
+  const liveTrebleRef    = useRef(null);
+  const liveEqConnected  = useRef(false);
+  // Sleep timer
+  const sleepIntervalRef = useRef(null);
+  const onSleepEndRef    = useRef(null);
 
   // ─── Derived ──────────────────────────────────────────────────────────────
   const contextTracks = useMemo(() => {
@@ -277,14 +309,19 @@ function MusicPlayer() {
         if (Object.keys(acCovers).length)  setArtistCovers(acCovers);
         if (Object.keys(alcCovers).length) setAlbumCovers(alcCovers);
 
-        if (s.eqBass        !== undefined) setEqBass(s.eqBass);
-        if (s.eqMid         !== undefined) setEqMid(s.eqMid);
-        if (s.eqTreble      !== undefined) setEqTreble(s.eqTreble);
-        if (s.volume        !== undefined) { setVolume(s.volume); if (audioRef.current) audioRef.current.volume = s.volume; }
-        if (s.repeat        !== undefined) setRepeat(s.repeat);
-        if (s.shuffle       !== undefined) setShuffle(s.shuffle);
-        if (s.headphoneOnly !== undefined) setHeadphoneOnly(s.headphoneOnly);
-        if (s.activeCtxId   !== undefined) setActiveCtxId(s.activeCtxId);
+        if (s.eqBass          !== undefined) setEqBass(s.eqBass);
+        if (s.eqMid           !== undefined) setEqMid(s.eqMid);
+        if (s.eqTreble        !== undefined) setEqTreble(s.eqTreble);
+        if (s.volume          !== undefined) { setVolume(s.volume); if (audioRef.current) audioRef.current.volume = s.volume; }
+        if (s.repeat          !== undefined) setRepeat(s.repeat);
+        if (s.shuffle         !== undefined) setShuffle(s.shuffle);
+        if (s.headphoneOnly   !== undefined) setHeadphoneOnly(s.headphoneOnly);
+        if (s.activeCtxId     !== undefined) setActiveCtxId(s.activeCtxId);
+        if (s.liveEqBass      !== undefined) setLiveEqBass(s.liveEqBass);
+        if (s.liveEqMid       !== undefined) setLiveEqMid(s.liveEqMid);
+        if (s.liveEqTreble    !== undefined) setLiveEqTreble(s.liveEqTreble);
+        if (s.playbackSpeed   !== undefined) { setPlaybackSpeed(s.playbackSpeed); if (audioRef.current) audioRef.current.playbackRate = s.playbackSpeed; }
+        // liveEqEnabled intentionally NOT restored — must be re-enabled per session (iOS AudioContext)
 
         if (dbMeta.length > 0) {
           const order  = s.trackOrder || [];
@@ -339,6 +376,7 @@ function MusicPlayer() {
     const t = setTimeout(() => {
       const toSave = {
         eqBass, eqMid, eqTreble, volume, repeat, shuffle, headphoneOnly, activeCtxId,
+        liveEqBass, liveEqMid, liveEqTreble, playbackSpeed,
         playlistOrder:  playlists.map(p => p.id),
         trackOrder:     tracks.map(t => t.id),
         currentTrackId: currentIdx !== null ? (contextTracks[currentIdx]?.id ?? null) : null,
@@ -346,7 +384,7 @@ function MusicPlayer() {
       Promise.all(Object.entries(toSave).map(([key, value]) => dbPut('settings', { key, value }))).catch(console.error);
     }, 600);
     return () => clearTimeout(t);
-  }, [eqBass, eqMid, eqTreble, volume, repeat, shuffle, headphoneOnly, activeCtxId, tracks, currentIdx, dbLoaded, contextTracks, playlists]);
+  }, [eqBass, eqMid, eqTreble, volume, repeat, shuffle, headphoneOnly, activeCtxId, liveEqBass, liveEqMid, liveEqTreble, playbackSpeed, tracks, currentIdx, dbLoaded, contextTracks, playlists]);
 
   // ─── Virtual scroll container messen ──────────────────────────────────────
   useEffect(() => {
@@ -539,14 +577,20 @@ function MusicPlayer() {
       if (document.visibilityState === 'hidden') {
         // Merken ob Audio lief (gilt auch wenn iOS es nicht selbst pausiert hat)
         wasPlaying = !(audioRef.current?.paused ?? true) && !userPausedRef.current;
-      } else if (document.visibilityState === 'visible' && wasPlaying && !userPausedRef.current) {
-        wasPlaying = false;
-        const audio = audioRef.current;
-        if (!audio) return;
-        const pos = audio.currentTime;
-        if (!audio.paused) audio.pause();   // erst pausieren...
-        audio.currentTime = pos;
-        try { await audio.play(); setPlaying(true); } catch (_) {} // ...dann neu starten
+      } else if (document.visibilityState === 'visible') {
+        // Resume live EQ AudioContext after screen unlock (iOS suspends it)
+        if (liveEqConnected.current && liveAudioCtxRef.current?.state === 'suspended') {
+          liveAudioCtxRef.current.resume().catch(() => {});
+        }
+        if (wasPlaying && !userPausedRef.current) {
+          wasPlaying = false;
+          const audio = audioRef.current;
+          if (!audio) return;
+          const pos = audio.currentTime;
+          if (!audio.paused) audio.pause();
+          audio.currentTime = pos;
+          try { await audio.play(); setPlaying(true); } catch (_) {}
+        }
       }
     };
     document.addEventListener('visibilitychange', onVisibility);
@@ -1118,6 +1162,9 @@ function MusicPlayer() {
     playedHistoryRef.current = [];
     playHistoryRef.current   = [];
     historyPosRef.current    = -1;
+    if (sleepIntervalRef.current) { clearInterval(sleepIntervalRef.current); sleepIntervalRef.current = null; }
+    setSleepMinutes(0); setSleepRemaining(null);
+    setPlaybackSpeed(1); if (audioRef.current) audioRef.current.playbackRate = 1;
     showToast("Bibliothek gelöscht.");
   };
 
@@ -1197,7 +1244,86 @@ function MusicPlayer() {
     return () => { audio.removeEventListener('timeupdate', onTime); audio.removeEventListener('loadedmetadata', onDur); audio.removeEventListener('ended', onEnd); };
   }, [previewScrubbing]);
 
-  useEffect(() => { return () => { audioCtxRef.current?.close().catch(() => {}); }; }, []);
+  useEffect(() => { return () => {
+    audioCtxRef.current?.close().catch(() => {});
+    liveAudioCtxRef.current?.close().catch(() => {});
+    if (sleepIntervalRef.current) clearInterval(sleepIntervalRef.current);
+  }; }, []);
+
+  // ─── Live-EQ ──────────────────────────────────────────────────────────────
+  // Once enabled, connects the main audio element to an AudioContext chain.
+  // Disabling sets gains to 0 (transparent) without disconnecting.
+  // ⚠ iOS: AudioContext is suspended when screen locks → no sound during lock.
+  const setupLiveEq = async () => {
+    if (!audioRef.current) return;
+    if (!liveEqConnected.current) {
+      const AC  = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AC();
+      const bass   = ctx.createBiquadFilter(); bass.type   = 'lowshelf';  bass.frequency.value = 150;
+      const mid    = ctx.createBiquadFilter(); mid.type    = 'peaking';   mid.frequency.value  = 1000; mid.Q.value = 1;
+      const treble = ctx.createBiquadFilter(); treble.type = 'highshelf'; treble.frequency.value = 4000;
+      const src = ctx.createMediaElementSource(audioRef.current);
+      src.connect(bass); bass.connect(mid); mid.connect(treble); treble.connect(ctx.destination);
+      liveAudioCtxRef.current = ctx;
+      liveBassRef.current     = bass;
+      liveMidRef.current      = mid;
+      liveTrebleRef.current   = treble;
+      liveEqConnected.current = true;
+    }
+    if (liveAudioCtxRef.current.state === 'suspended') await liveAudioCtxRef.current.resume();
+  };
+
+  useEffect(() => {
+    if (liveEqEnabled) {
+      setupLiveEq();
+    } else if (liveEqConnected.current && liveAudioCtxRef.current) {
+      const now = liveAudioCtxRef.current.currentTime;
+      liveBassRef.current?.gain.setValueAtTime(0, now);
+      liveMidRef.current?.gain.setValueAtTime(0, now);
+      liveTrebleRef.current?.gain.setValueAtTime(0, now);
+    }
+  }, [liveEqEnabled]); // eslint-disable-line
+
+  useEffect(() => {
+    if (!liveEqConnected.current || !liveAudioCtxRef.current) return;
+    const now = liveAudioCtxRef.current.currentTime;
+    liveBassRef.current?.gain.setValueAtTime(liveEqEnabled ? liveEqBass   : 0, now);
+    liveMidRef.current?.gain.setValueAtTime(liveEqEnabled  ? liveEqMid    : 0, now);
+    liveTrebleRef.current?.gain.setValueAtTime(liveEqEnabled ? liveEqTreble : 0, now);
+  }, [liveEqBass, liveEqMid, liveEqTreble, liveEqEnabled]);
+
+  // ─── Playback speed ───────────────────────────────────────────────────────
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.playbackRate = playbackSpeed;
+  }, [playbackSpeed]);
+
+  // ─── Sleep timer ──────────────────────────────────────────────────────────
+  onSleepEndRef.current = () => {
+    if (audioRef.current) { audioRef.current.pause(); }
+    setPlaying(false);
+    setSleepMinutes(0);
+    showToast('Sleep Timer: Wiedergabe gestoppt.');
+  };
+
+  useEffect(() => {
+    if (sleepIntervalRef.current) { clearInterval(sleepIntervalRef.current); sleepIntervalRef.current = null; }
+    if (sleepMinutes > 0) {
+      let secs = sleepMinutes * 60;
+      setSleepRemaining(secs);
+      sleepIntervalRef.current = setInterval(() => {
+        secs--;
+        setSleepRemaining(secs);
+        if (secs <= 0) {
+          clearInterval(sleepIntervalRef.current);
+          sleepIntervalRef.current = null;
+          onSleepEndRef.current?.();
+        }
+      }, 1000);
+    } else {
+      setSleepRemaining(null);
+    }
+    return () => { if (sleepIntervalRef.current) clearInterval(sleepIntervalRef.current); };
+  }, [sleepMinutes]);
 
   const ensureAudioCtx = async () => {
     if (audioCtxRef.current) { if (audioCtxRef.current.state === 'suspended') await audioCtxRef.current.resume(); return; }
@@ -1824,116 +1950,234 @@ function MusicPlayer() {
         )}
 
         {/* ── EINSTELLUNGEN ── */}
-        {view === "tuning" && (
-          <div className="flat-card" style={{ flex:1, overflowY:"auto", padding:"24px" }}>
-
-            <div style={{ marginBottom:32 }}>
-              <h3 style={{ fontSize:18, fontWeight:800, marginBottom:20 }}>Allgemein</h3>
-              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-                <div>
-                  <div style={{ fontSize:13, fontWeight:600, color:"#fff", marginBottom:3 }}>Nur mit Kopfhörern</div>
-                  <div style={{ fontSize:11, color:"#555", lineHeight:1.5 }}>
-                    {headphonesDetected===true && "🎧 Kopfhörer erkannt"}{headphonesDetected===false && "🔈 Kein Kopfhörer erkannt"}{headphonesDetected===null && "Status unbekannt"}
-                  </div>
-                </div>
-                <button onClick={() => setHeadphoneOnly(v=>!v)}
-                  style={{ width:44, height:26, borderRadius:13, background:headphoneOnly?"#fc3c44":"#2a2a2a", border:`1px solid ${headphoneOnly?"#fc3c44":"#444"}`, cursor:"pointer", position:"relative", flexShrink:0, transition:"all 0.2s" }}>
-                  <div style={{ width:18, height:18, borderRadius:"50%", background:"#fff", position:"absolute", top:3, left:headphoneOnly?22:3, transition:"left 0.2s" }} />
-                </button>
+        {view === "tuning" && (() => {
+          // Shared sub-components (defined inline to access state)
+          const Toggle = ({ on, onClick }) => (
+            <button onClick={onClick} style={{ width:44, height:26, borderRadius:13, background:on?"#fc3c44":"#2a2a2a", border:`1px solid ${on?"#fc3c44":"#444"}`, cursor:"pointer", position:"relative", flexShrink:0, transition:"background 0.2s" }}>
+              <div style={{ width:18, height:18, borderRadius:"50%", background:"#fff", position:"absolute", top:3, left:on?22:3, transition:"left 0.2s" }} />
+            </button>
+          );
+          const SRow = ({ label, sub, children }) => (
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:12 }}>
+              <div style={{ flex:1 }}>
+                <div style={{ fontSize:13, fontWeight:600 }}>{label}</div>
+                {sub && <div style={{ fontSize:11, color:"#555", marginTop:2, lineHeight:1.5 }}>{sub}</div>}
               </div>
-              {headphoneOnly && headphonesDetected===null && (
-                <div style={{ marginTop:12, fontSize:11, color:"#555", lineHeight:1.6 }}>Kopfhörererkennung benötigt Browser-Berechtigung. Auf iOS nicht verfügbar.</div>
-              )}
+              {children}
             </div>
-
-            <div style={{ marginBottom:32 }}>
-              <h3 style={{ fontSize:18, fontWeight:800, marginBottom:8 }}>Song-Tuner</h3>
-              <p style={{ fontSize:12, color:"#666", marginBottom:20 }}>Wähle einen Titel, stelle den EQ ein, höre live rein — und exportiere dann die fertige Datei.</p>
-              <div style={{ marginBottom:20 }}>
-                <label style={{ display:"block", fontSize:12, fontWeight:600, color:"#888", marginBottom:8 }}>Titel auswählen:</label>
-                <select value={renderTrackIdx} onChange={e => setRenderTrackIdx(e.target.value)}
-                  style={{ width:"100%", background:"#1a1a1a", border:"1px solid #333", borderRadius:10, padding:"10px", color:"#fff", fontSize:13, outline:"none" }}>
-                  <option value="">-- Bitte wählen --</option>
-                  {tracks.map((t,i) => <option key={t.id} value={i}>{t.name}{t.artist ? ` – ${t.artist}` : ''}</option>)}
-                </select>
+          );
+          const Divider = () => <div style={{ borderTop:"1px solid #1e1e1e", margin:"16px 0" }} />;
+          const CardH = ({ title }) => <h3 style={{ fontSize:15, fontWeight:800, marginBottom:16, color:"#fff" }}>{title}</h3>;
+          const EqSlider = ({ label, val, set, color="#fc3c44" }) => (
+            <div style={{ marginBottom:14 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", fontSize:12, color:"#666", marginBottom:5 }}>
+                <span>{label}</span>
+                <span style={{ color, fontWeight:700 }}>{val>0?`+${val}`:val} dB</span>
               </div>
-              {[{label:"Bass (150Hz)",val:eqBass,set:setEqBass},{label:"Mitten (1kHz)",val:eqMid,set:setEqMid},{label:"Höhen (4kHz)",val:eqTreble,set:setEqTreble}].map((band,i) => (
-                <div key={i} style={{ marginBottom:20 }}>
-                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:12, color:"#666", marginBottom:6 }}>
-                    <span>{band.label}</span>
-                    <span style={{ color:"#fc3c44", fontWeight:700 }}>{band.val>0?`+${band.val}`:band.val} dB</span>
+              <input type="range" min="-12" max="12" step="1" value={val} onChange={e => set(parseInt(e.target.value))}
+                style={{ width:"100%", background:`linear-gradient(to right,${color} ${((val+12)/24)*100}%,#222 ${((val+12)/24)*100}%)` }} />
+            </div>
+          );
+
+          return (
+            <div style={{ flex:1, overflowY:"auto", display:"flex", flexDirection:"column", gap:10 }}>
+
+              {/* ── Allgemein ── */}
+              <div className="flat-card" style={{ padding:"20px", flexShrink:0 }}>
+                <CardH title="Allgemein" />
+
+                <SRow label="Nur mit Kopfhörern"
+                  sub={headphonesDetected===true?"🎧 Kopfhörer erkannt":headphonesDetected===false?"🔈 Kein Kopfhörer erkannt":"Status unbekannt"}>
+                  <Toggle on={headphoneOnly} onClick={() => setHeadphoneOnly(v=>!v)} />
+                </SRow>
+                {headphoneOnly && headphonesDetected===null && (
+                  <div style={{ marginTop:8, fontSize:11, color:"#555", lineHeight:1.6 }}>Auf iOS nicht verfügbar.</div>
+                )}
+
+                <Divider />
+
+                <div>
+                  <div style={{ fontSize:13, fontWeight:600, marginBottom:10 }}>Wiedergabegeschwindigkeit</div>
+                  <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+                    {SPEEDS.map(s => (
+                      <button key={s} onClick={() => setPlaybackSpeed(s)}
+                        style={{ padding:"5px 10px", borderRadius:8, fontSize:12, fontWeight:600, cursor:"pointer",
+                          background:playbackSpeed===s?"#fc3c44":"#1e1e1e",
+                          color:playbackSpeed===s?"#fff":"#888",
+                          border:`1px solid ${playbackSpeed===s?"#fc3c44":"#2a2a2a"}` }}>
+                        {s===1?"1× (normal)":`${s}×`}
+                      </button>
+                    ))}
                   </div>
-                  <input type="range" min="-12" max="12" step="1" value={band.val} onChange={e => band.set(parseInt(e.target.value))}
-                    style={{ width:"100%", background:`linear-gradient(to right,#fc3c44 ${((band.val+12)/24)*100}%,#222 ${((band.val+12)/24)*100}%)` }} />
                 </div>
-              ))}
-              {renderTrackIdx !== "" && (
-                <div style={{ borderTop:"1px solid #1e1e1e", paddingTop:20, marginBottom:20 }}>
-                  <div style={{ fontSize:10, fontWeight:600, color:"#3a3a3a", letterSpacing:"0.1em", marginBottom:12 }}>LIVE-VORSCHAU</div>
-                  <div style={{ fontSize:14, fontWeight:700, color:previewPlaying?"#fc3c44":"#ccc", marginBottom:14, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{tracks[parseInt(renderTrackIdx)]?.name}</div>
-                  <div style={{ marginBottom:16 }}>
+
+                <Divider />
+
+                <div>
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
+                    <div style={{ fontSize:13, fontWeight:600 }}>Sleep Timer</div>
+                    {sleepRemaining !== null && (
+                      <div style={{ fontSize:12, color:"#fc3c44", fontWeight:700 }}>
+                        ⏱ {formatTime(sleepRemaining)}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+                    {SLEEP_OPTS.map(m => (
+                      <button key={m} onClick={() => setSleepMinutes(m)}
+                        style={{ padding:"5px 10px", borderRadius:8, fontSize:12, fontWeight:600, cursor:"pointer",
+                          background:sleepMinutes===m?"#fc3c44":"#1e1e1e",
+                          color:sleepMinutes===m?"#fff":"#888",
+                          border:`1px solid ${sleepMinutes===m?"#fc3c44":"#2a2a2a"}` }}>
+                        {m===0?"Aus":`${m} Min`}
+                      </button>
+                    ))}
+                  </div>
+                  {sleepRemaining !== null && (
+                    <div style={{ marginTop:10, fontSize:11, color:"#555" }}>
+                      Stoppt in {formatTime(sleepRemaining)} · <span onClick={() => setSleepMinutes(0)} style={{ color:"#fc3c44", cursor:"pointer", fontWeight:600 }}>Abbrechen</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* ── Live-EQ ── */}
+              <div className="flat-card" style={{ padding:"20px", flexShrink:0 }}>
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:4 }}>
+                  <h3 style={{ fontSize:15, fontWeight:800 }}>Live-EQ</h3>
+                  <Toggle on={liveEqEnabled} onClick={() => setLiveEqEnabled(v=>!v)} />
+                </div>
+                <div style={{ fontSize:11, color:"#555", marginBottom:liveEqEnabled?16:0, lineHeight:1.5 }}>
+                  Echtzeitfilter für alle Songs.{" "}
+                  <span style={{ color:"#3a3a3a" }}>⚠ Auf iOS kein Ton am Sperrbildschirm.</span>
+                </div>
+
+                {liveEqEnabled && (
+                  <>
+                    {/* Presets */}
+                    <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:16 }}>
+                      {EQ_PRESETS.map(p => {
+                        const active = liveEqBass===p.b && liveEqMid===p.m && liveEqTreble===p.t;
+                        return (
+                          <button key={p.name} onClick={() => { setLiveEqBass(p.b); setLiveEqMid(p.m); setLiveEqTreble(p.t); }}
+                            style={{ padding:"5px 11px", borderRadius:8, fontSize:12, fontWeight:600, cursor:"pointer",
+                              background:active?"#fc3c44":"#1e1e1e",
+                              color:active?"#fff":"#888",
+                              border:`1px solid ${active?"#fc3c44":"#2a2a2a"}` }}>
+                            {p.name}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <EqSlider label="Bass (150 Hz)"   val={liveEqBass}   set={setLiveEqBass}   />
+                    <EqSlider label="Mitten (1 kHz)"  val={liveEqMid}    set={setLiveEqMid}    />
+                    <EqSlider label="Höhen (4 kHz)"   val={liveEqTreble} set={setLiveEqTreble} />
+                  </>
+                )}
+              </div>
+
+              {/* ── Song-Tuner ── */}
+              <div className="flat-card" style={{ padding:"20px", flexShrink:0 }}>
+                <CardH title="Song-Tuner" />
+                <p style={{ fontSize:11, color:"#666", marginBottom:16, lineHeight:1.6 }}>EQ in eine Datei einbrennen und exportieren. Funktioniert auch am Sperrbildschirm.</p>
+                <div style={{ marginBottom:16 }}>
+                  <label style={{ display:"block", fontSize:11, fontWeight:600, color:"#888", marginBottom:8 }}>Titel auswählen</label>
+                  <select value={renderTrackIdx} onChange={e => setRenderTrackIdx(e.target.value)}
+                    style={{ width:"100%", background:"#1a1a1a", border:"1px solid #333", borderRadius:10, padding:"10px", color:"#fff", fontSize:13, outline:"none" }}>
+                    <option value="">-- Bitte wählen --</option>
+                    {tracks.map((t,i) => <option key={t.id} value={i}>{t.name}{t.artist ? ` – ${t.artist}` : ''}</option>)}
+                  </select>
+                </div>
+
+                {/* Presets for tuner */}
+                <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:14 }}>
+                  {EQ_PRESETS.map(p => {
+                    const active = eqBass===p.b && eqMid===p.m && eqTreble===p.t;
+                    return (
+                      <button key={p.name} onClick={() => { setEqBass(p.b); setEqMid(p.m); setEqTreble(p.t); }}
+                        style={{ padding:"5px 11px", borderRadius:8, fontSize:12, fontWeight:600, cursor:"pointer",
+                          background:active?"#444":"#1e1e1e",
+                          color:active?"#fff":"#666",
+                          border:`1px solid ${active?"#555":"#2a2a2a"}` }}>
+                        {p.name}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <EqSlider label="Bass (150 Hz)"  val={eqBass}   set={setEqBass}   color="#888" />
+                <EqSlider label="Mitten (1 kHz)" val={eqMid}    set={setEqMid}    color="#888" />
+                <EqSlider label="Höhen (4 kHz)"  val={eqTreble} set={setEqTreble} color="#888" />
+
+                {renderTrackIdx !== "" && (
+                  <div style={{ borderTop:"1px solid #1e1e1e", paddingTop:16, marginTop:4, marginBottom:16 }}>
+                    <div style={{ fontSize:10, fontWeight:600, color:"#3a3a3a", letterSpacing:"0.1em", marginBottom:10 }}>VORSCHAU</div>
+                    <div style={{ fontSize:13, fontWeight:700, color:previewPlaying?"#fc3c44":"#ccc", marginBottom:12, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{tracks[parseInt(renderTrackIdx)]?.name}</div>
                     <input type="range" min="0" max={previewDuration||100} value={previewTime}
                       onMouseDown={() => setPreviewScrubbing(true)} onMouseUp={() => setPreviewScrubbing(false)}
                       onTouchStart={() => setPreviewScrubbing(true)} onTouchEnd={() => setPreviewScrubbing(false)}
                       onChange={(e) => { const v=parseFloat(e.target.value); setPreviewTime(v); if(previewAudioRef.current) previewAudioRef.current.currentTime=v; }}
-                      style={{ width:"100%", marginBottom:6, background:`linear-gradient(to right,#fc3c44 ${previewProgress}%,#222 ${previewProgress}%)` }} />
-                    <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, color:"#555" }}>
+                      style={{ width:"100%", marginBottom:4, background:`linear-gradient(to right,#888 ${previewProgress}%,#222 ${previewProgress}%)` }} />
+                    <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, color:"#555", marginBottom:14 }}>
                       <span>{formatTime(previewTime)}</span><span>-{formatTime(previewDuration-previewTime)}</span>
                     </div>
-                  </div>
-                  <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:24 }}>
-                    <button onClick={() => seekPreview(-10)} className="icon-btn" style={{ flexDirection:"column", gap:3, color:"#555" }}>
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.45"/></svg>
-                      <span style={{ fontSize:9 }}>10s</span>
-                    </button>
-                    <button onClick={togglePreviewPlay}
-                      style={{ width:52, height:52, borderRadius:"50%", background:previewPlaying?"#fc3c44":"#242424", border:`2px solid ${previewPlaying?"#fc3c44":"#333"}`, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.15s" }}>
-                      {previewPlaying ? <svg width="17" height="17" viewBox="0 0 24 24" fill="#fff"><rect x="5" y="4" width="4" height="16" rx="1"/><rect x="15" y="4" width="4" height="16" rx="1"/></svg>
-                                      : <svg width="17" height="17" viewBox="0 0 24 24" fill="#fff" style={{ marginLeft:2 }}><polygon points="6 3 20 12 6 21 6 3"/></svg>}
-                    </button>
-                    <button onClick={() => seekPreview(10)} className="icon-btn" style={{ flexDirection:"column", gap:3, color:"#555" }}>
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-.49-3.45"/></svg>
-                      <span style={{ fontSize:9 }}>10s</span>
-                    </button>
-                  </div>
-                </div>
-              )}
-              <button onClick={renderAndDownloadTrack} disabled={isRendering||renderTrackIdx===""}
-                style={{ width:"100%", background:renderTrackIdx===""?"#1a1a1a":"#222", color:renderTrackIdx===""?"#444":"#fff", border:`1px solid ${renderTrackIdx===""?"#222":"#444"}`, borderRadius:12, padding:"12px", fontSize:14, fontWeight:700, cursor:renderTrackIdx===""?"not-allowed":"pointer" }}>
-                {isRendering ? "Berechne EQ..." : "↓  Tuned song exportieren  (m4a)"}
-              </button>
-            </div>
-
-            <div>
-              <h3 style={{ fontSize:18, fontWeight:800, marginBottom:8 }}>Backup</h3>
-              <p style={{ fontSize:12, color:"#666", marginBottom:4 }}>Speichert Playlists, Cover und EQ — kein Audio. Backup einfach in den Musik-Ordner legen, es wird beim nächsten Ordner-Import automatisch erkannt.</p>
-              <p style={{ fontSize:11, color:"#3a3a3a", marginBottom:20, lineHeight:1.6 }}>Manueller Import: erst Musik laden, dann Backup importieren (nur JSON nötig).</p>
-              <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
-                <button onClick={exportBackup} disabled={isExporting||(!tracks.length&&!playlists.length)}
-                  style={{ width:"100%", background:(!tracks.length&&!playlists.length)?"#1a1a1a":"#0f3d22", color:(!tracks.length&&!playlists.length)?"#444":"#4ade80", border:`1px solid ${(!tracks.length&&!playlists.length)?"#222":"#1a5c32"}`, borderRadius:12, padding:"12px", fontSize:14, fontWeight:700, cursor:(!tracks.length&&!playlists.length)?"not-allowed":"pointer" }}>
-                  {isExporting ? "Erstelle Backup…" : `↓  Backup exportieren  (${playlists.length} Playlists, ${Object.keys(artistCovers).length + Object.keys(albumCovers).length} Cover)`}
-                </button>
-                <button onClick={() => !isImporting && importRef.current?.click()} disabled={isImporting}
-                  style={{ width:"100%", background:"#0f1f3d", color:isImporting?"#666":"#60a5fa", border:"1px solid #1a2f5c", borderRadius:12, padding:"12px", fontSize:14, fontWeight:700, cursor:isImporting?"not-allowed":"pointer" }}>
-                  {isImporting ? "Importiere…" : "↑  Backup importieren  (nur JSON)"}
-                </button>
-                {!confirmClear ? (
-                  <button onClick={() => setConfirmClear(true)} style={{ width:"100%", background:"none", color:"#444", border:"1px solid #222", borderRadius:12, padding:"12px", fontSize:14, fontWeight:700, cursor:"pointer" }}>
-                    Bibliothek löschen
-                  </button>
-                ) : (
-                  <div style={{ display:"flex", gap:8 }}>
-                    <button onClick={clearLibrary} style={{ flex:1, background:"#3d0f0f", color:"#f87171", border:"1px solid #5c1a1a", borderRadius:12, padding:"12px", fontSize:13, fontWeight:700, cursor:"pointer" }}>Ja, alles löschen</button>
-                    <button onClick={() => setConfirmClear(false)} style={{ flex:1, background:"#1a1a1a", color:"#888", border:"1px solid #333", borderRadius:12, padding:"12px", fontSize:13, fontWeight:700, cursor:"pointer" }}>Abbrechen</button>
+                    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:24 }}>
+                      <button onClick={() => seekPreview(-10)} className="icon-btn" style={{ flexDirection:"column", gap:3, color:"#555" }}>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.45"/></svg>
+                        <span style={{ fontSize:9 }}>10s</span>
+                      </button>
+                      <button onClick={togglePreviewPlay}
+                        style={{ width:48, height:48, borderRadius:"50%", background:previewPlaying?"#444":"#242424", border:`2px solid ${previewPlaying?"#666":"#333"}`, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>
+                        {previewPlaying ? <svg width="15" height="15" viewBox="0 0 24 24" fill="#fff"><rect x="5" y="4" width="4" height="16" rx="1"/><rect x="15" y="4" width="4" height="16" rx="1"/></svg>
+                                        : <svg width="15" height="15" viewBox="0 0 24 24" fill="#fff" style={{ marginLeft:2 }}><polygon points="6 3 20 12 6 21 6 3"/></svg>}
+                      </button>
+                      <button onClick={() => seekPreview(10)} className="icon-btn" style={{ flexDirection:"column", gap:3, color:"#555" }}>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-.49-3.45"/></svg>
+                        <span style={{ fontSize:9 }}>10s</span>
+                      </button>
+                    </div>
                   </div>
                 )}
+                <button onClick={renderAndDownloadTrack} disabled={isRendering||renderTrackIdx===""}
+                  style={{ width:"100%", background:renderTrackIdx===""?"#1a1a1a":"#222", color:renderTrackIdx===""?"#444":"#fff", border:`1px solid ${renderTrackIdx===""?"#222":"#333"}`, borderRadius:12, padding:"12px", fontSize:13, fontWeight:700, cursor:renderTrackIdx===""?"not-allowed":"pointer" }}>
+                  {isRendering ? "Berechne EQ…" : "↓ Tuned Song exportieren (.m4a)"}
+                </button>
               </div>
-              <div style={{ marginTop:16, padding:"12px 14px", background:"#0d0d0d", borderRadius:10, fontSize:11, color:"#3a3a3a", lineHeight:1.7 }}>
-                ⚡ Musik bleibt in deiner Ordnerstruktur. Das Backup sichert nur Playlists, Cover und Einstellungen.
+
+              {/* ── Bibliothek / Backup ── */}
+              <div className="flat-card" style={{ padding:"20px", flexShrink:0 }}>
+                <CardH title="Bibliothek & Backup" />
+                <p style={{ fontSize:11, color:"#666", marginBottom:4, lineHeight:1.6 }}>Backup speichert Playlists, Cover und EQ — kein Audio. Datei in den Musik-Ordner legen, sie wird beim nächsten Ordner-Import automatisch erkannt.</p>
+                <p style={{ fontSize:11, color:"#3a3a3a", marginBottom:16, lineHeight:1.6 }}>Manueller Import: erst Musik laden, dann Backup importieren (nur JSON nötig).</p>
+                <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+                  <button onClick={exportBackup} disabled={isExporting||(!tracks.length&&!playlists.length)}
+                    style={{ width:"100%", background:(!tracks.length&&!playlists.length)?"#1a1a1a":"#0f3d22", color:(!tracks.length&&!playlists.length)?"#444":"#4ade80", border:`1px solid ${(!tracks.length&&!playlists.length)?"#222":"#1a5c32"}`, borderRadius:12, padding:"11px", fontSize:13, fontWeight:700, cursor:(!tracks.length&&!playlists.length)?"not-allowed":"pointer" }}>
+                    {isExporting ? "Erstelle Backup…" : `↓ Backup exportieren (${playlists.length} Playlists · ${Object.keys(artistCovers).length + Object.keys(albumCovers).length} Cover)`}
+                  </button>
+                  <button onClick={() => !isImporting && importRef.current?.click()} disabled={isImporting}
+                    style={{ width:"100%", background:"#0f1f3d", color:isImporting?"#666":"#60a5fa", border:"1px solid #1a2f5c", borderRadius:12, padding:"11px", fontSize:13, fontWeight:700, cursor:isImporting?"not-allowed":"pointer" }}>
+                    {isImporting ? "Importiere…" : "↑ Backup importieren (nur JSON)"}
+                  </button>
+                  {!confirmClear ? (
+                    <button onClick={() => setConfirmClear(true)} style={{ width:"100%", background:"none", color:"#444", border:"1px solid #222", borderRadius:12, padding:"11px", fontSize:13, fontWeight:700, cursor:"pointer" }}>
+                      Bibliothek löschen
+                    </button>
+                  ) : (
+                    <div style={{ display:"flex", gap:8 }}>
+                      <button onClick={clearLibrary} style={{ flex:1, background:"#3d0f0f", color:"#f87171", border:"1px solid #5c1a1a", borderRadius:12, padding:"11px", fontSize:13, fontWeight:700, cursor:"pointer" }}>Ja, alles löschen</button>
+                      <button onClick={() => setConfirmClear(false)} style={{ flex:1, background:"#1a1a1a", color:"#888", border:"1px solid #333", borderRadius:12, padding:"11px", fontSize:13, fontWeight:700, cursor:"pointer" }}>Abbrechen</button>
+                    </div>
+                  )}
+                </div>
+                <div style={{ marginTop:12, padding:"10px 12px", background:"#0d0d0d", borderRadius:10, fontSize:11, color:"#3a3a3a", lineHeight:1.7 }}>
+                  ⚡ Musik bleibt in deiner Ordnerstruktur. Das Backup sichert nur Playlists, Cover und Einstellungen.
+                </div>
               </div>
+
+              <div style={{ height:8, flexShrink:0 }} />
             </div>
-          </div>
-        )}
+          );
+        })()}
 
         <div style={{ textAlign:"center", marginTop:16, fontSize:10, color:"#2a2a2a", fontWeight:600, letterSpacing:"0.06em", flexShrink:0 }}>MUSIC</div>
       </div>
