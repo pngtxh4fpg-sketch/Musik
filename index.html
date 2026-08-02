@@ -213,6 +213,8 @@ function MusicPlayer() {
   const playedHistoryRef = useRef([]);  // für Shuffle-Deduplizierung
   const playHistoryRef   = useRef([]);  // Navigations-History (Stack)
   const historyPosRef    = useRef(-1);  // aktuelle Position im Stack
+  const userPausedRef    = useRef(false); // User hat explizit pausiert
+  const interruptedRef   = useRef(false); // Audio durch Anruf/System unterbrochen
   const listContainerRef = useRef(null);
   const dragSt           = useRef(null);
   const commitDragRef    = useRef(null);
@@ -465,7 +467,12 @@ function MusicPlayer() {
 
   const togglePlay = useCallback(async () => {
     if (!audioRef.current || !currentTrack) return;
-    if (playing) { audioRef.current.pause(); setPlaying(false); return; }
+    if (playing) {
+      userPausedRef.current = true;    // User hat bewusst pausiert
+      interruptedRef.current = false;
+      audioRef.current.pause(); setPlaying(false); return;
+    }
+    userPausedRef.current = false;     // User möchte abspielen
     if (headphoneOnly && headphonesDetected === false) { showToast("Kopfhörer erforderlich."); return; }
     if (!currentTrack.url) {
       const blob = await loadBlob(currentTrack.id);
@@ -484,7 +491,6 @@ function MusicPlayer() {
     if (!audio) return;
     const onTime = () => {
       if (!isScrubbing) setCurrentTime(audio.currentTime);
-      // Sperrbildschirm-Scrubber braucht aktuelle Position
       if ('mediaSession' in navigator && !isNaN(audio.duration) && audio.duration > 0) {
         try {
           navigator.mediaSession.setPositionState({
@@ -497,23 +503,72 @@ function MusicPlayer() {
     };
     const onDur   = () => setDuration(audio.duration);
     const onEnded = () => { if (repeat) { audio.currentTime = 0; audio.play(); } else goNext(); };
-    audio.addEventListener("timeupdate", onTime);
-    audio.addEventListener("loadedmetadata", onDur);
-    audio.addEventListener("ended", onEnded);
-    return () => { audio.removeEventListener("timeupdate", onTime); audio.removeEventListener("loadedmetadata", onDur); audio.removeEventListener("ended", onEnded); };
+    // Unterbrechungs-Erkennung: wenn Audio pausiert ohne dass der User es wollte
+    const onPause = () => {
+      if (!userPausedRef.current) interruptedRef.current = true;
+    };
+    const onPlay = () => {
+      interruptedRef.current = false;
+      userPausedRef.current  = false;
+    };
+    audio.addEventListener('timeupdate',    onTime);
+    audio.addEventListener('loadedmetadata',onDur);
+    audio.addEventListener('ended',         onEnded);
+    audio.addEventListener('pause',         onPause);
+    audio.addEventListener('play',          onPlay);
+    return () => {
+      audio.removeEventListener('timeupdate',    onTime);
+      audio.removeEventListener('loadedmetadata',onDur);
+      audio.removeEventListener('ended',         onEnded);
+      audio.removeEventListener('pause',         onPause);
+      audio.removeEventListener('play',          onPlay);
+    };
   }, [goNext, repeat, isScrubbing]);
 
   // Keep refs current so handlers never go stale
   useEffect(() => { goNextRef.current = goNext; }, [goNext]);
   useEffect(() => { goPrevRef.current = goPrev; }, [goPrev]);
 
+  // Audio-Session-Recovery nach Unterbrechung (Anruf, Siri, andere App)
+  // iOS gibt den Audio-Output manchmal nicht zurück → Audio läuft, aber kein Ton.
+  // Lösung: beim Zurückkehren zur App explizit pause→play, um die
+  // iOS Audio-Session neu zu beanspruchen.
+  useEffect(() => {
+    let wasPlaying = false;
+    const onVisibility = async () => {
+      if (document.visibilityState === 'hidden') {
+        // Merken ob Audio lief (gilt auch wenn iOS es nicht selbst pausiert hat)
+        wasPlaying = !(audioRef.current?.paused ?? true) && !userPausedRef.current;
+      } else if (document.visibilityState === 'visible' && wasPlaying && !userPausedRef.current) {
+        wasPlaying = false;
+        const audio = audioRef.current;
+        if (!audio) return;
+        const pos = audio.currentTime;
+        if (!audio.paused) audio.pause();   // erst pausieren...
+        audio.currentTime = pos;
+        try { await audio.play(); setPlaying(true); } catch (_) {} // ...dann neu starten
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, []);
+
   // Single mediaSession effect — handlers + metadata + playbackState must all be set
   // atomically so iOS sees next/prev handlers at the exact moment playbackState = 'playing'.
   // Splitting into multiple effects causes iOS to briefly see no handlers → podcast mode.
   useEffect(() => {
     if (!('mediaSession' in navigator)) return;
-    navigator.mediaSession.setActionHandler('play',          () => { audioRef.current?.play(); setPlaying(true); });
-    navigator.mediaSession.setActionHandler('pause',         () => { audioRef.current?.pause(); setPlaying(false); });
+    navigator.mediaSession.setActionHandler('play', () => {
+      userPausedRef.current  = false;
+      interruptedRef.current = false;
+      audioRef.current?.play().catch(() => {});
+      setPlaying(true);
+    });
+    navigator.mediaSession.setActionHandler('pause', () => {
+      userPausedRef.current = true;
+      audioRef.current?.pause();
+      setPlaying(false);
+    });
     navigator.mediaSession.setActionHandler('nexttrack',     () => goNextRef.current?.());
     navigator.mediaSession.setActionHandler('previoustrack', () => goPrevRef.current?.());
     navigator.mediaSession.setActionHandler('seekto',        (d) => {
