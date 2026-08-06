@@ -152,7 +152,6 @@ const EQ_PRESETS = [
   { name:'Pop',     b:3,  m:3,  t:3  },
   { name:'Rock',    b:5,  m:0,  t:3  },
 ];
-const SPEEDS   = [0.5, 0.75, 1, 1.25, 1.5, 2];
 const SLEEP_OPTS = [0, 15, 30, 45, 60]; // 0 = off
 
 // ─── Component ────────────────────────────────────────────────────────────────
@@ -216,7 +215,6 @@ function MusicPlayer() {
   const [liveEqTreble, setLiveEqTreble]   = useState(0);
 
   // Playback extras
-  const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [sleepMinutes, setSleepMinutes]   = useState(0);   // 0 = off
   const [sleepRemaining, setSleepRemaining] = useState(null); // seconds
 
@@ -320,7 +318,6 @@ function MusicPlayer() {
         if (s.liveEqBass      !== undefined) setLiveEqBass(s.liveEqBass);
         if (s.liveEqMid       !== undefined) setLiveEqMid(s.liveEqMid);
         if (s.liveEqTreble    !== undefined) setLiveEqTreble(s.liveEqTreble);
-        if (s.playbackSpeed   !== undefined) { setPlaybackSpeed(s.playbackSpeed); if (audioRef.current) audioRef.current.playbackRate = s.playbackSpeed; }
         // liveEqEnabled intentionally NOT restored — must be re-enabled per session (iOS AudioContext)
 
         if (dbMeta.length > 0) {
@@ -376,7 +373,7 @@ function MusicPlayer() {
     const t = setTimeout(() => {
       const toSave = {
         eqBass, eqMid, eqTreble, volume, repeat, shuffle, headphoneOnly, activeCtxId,
-        liveEqBass, liveEqMid, liveEqTreble, playbackSpeed,
+        liveEqBass, liveEqMid, liveEqTreble,
         playlistOrder:  playlists.map(p => p.id),
         trackOrder:     tracks.map(t => t.id),
         currentTrackId: currentIdx !== null ? (contextTracks[currentIdx]?.id ?? null) : null,
@@ -384,7 +381,7 @@ function MusicPlayer() {
       Promise.all(Object.entries(toSave).map(([key, value]) => dbPut('settings', { key, value }))).catch(console.error);
     }, 600);
     return () => clearTimeout(t);
-  }, [eqBass, eqMid, eqTreble, volume, repeat, shuffle, headphoneOnly, activeCtxId, liveEqBass, liveEqMid, liveEqTreble, playbackSpeed, tracks, currentIdx, dbLoaded, contextTracks, playlists]);
+  }, [eqBass, eqMid, eqTreble, volume, repeat, shuffle, headphoneOnly, activeCtxId, liveEqBass, liveEqMid, liveEqTreble, tracks, currentIdx, dbLoaded, contextTracks, playlists]);
 
   // ─── Virtual scroll container messen ──────────────────────────────────────
   useEffect(() => {
@@ -1164,7 +1161,6 @@ function MusicPlayer() {
     historyPosRef.current    = -1;
     if (sleepIntervalRef.current) { clearInterval(sleepIntervalRef.current); sleepIntervalRef.current = null; }
     setSleepMinutes(0); setSleepRemaining(null);
-    setPlaybackSpeed(1); if (audioRef.current) audioRef.current.playbackRate = 1;
     showToast("Bibliothek gelöscht.");
   };
 
@@ -1291,11 +1287,6 @@ function MusicPlayer() {
     liveMidRef.current?.gain.setValueAtTime(liveEqEnabled  ? liveEqMid    : 0, now);
     liveTrebleRef.current?.gain.setValueAtTime(liveEqEnabled ? liveEqTreble : 0, now);
   }, [liveEqBass, liveEqMid, liveEqTreble, liveEqEnabled]);
-
-  // ─── Playback speed ───────────────────────────────────────────────────────
-  useEffect(() => {
-    if (audioRef.current) audioRef.current.playbackRate = playbackSpeed;
-  }, [playbackSpeed]);
 
   // ─── Sleep timer ──────────────────────────────────────────────────────────
   onSleepEndRef.current = () => {
@@ -1650,15 +1641,24 @@ function MusicPlayer() {
                   const cover = artistCovers[artistName] || [...albums.values()].flat().find(t => t.art)?.art || null;
                   const isActive = activeCtxId === `artist:${artistName}`;
                   return (
-                    <div key={artistName} onClick={() => setBrowseView(`artist:${artistName}`)}
-                      style={{ display:"flex", alignItems:"center", padding:"10px 14px", gap:12, borderBottom:"1px solid #1a1a1a", cursor:"pointer", background:isActive?"#0d0d0d":"transparent" }}>
-                      <TrackThumbnail art={cover} size={48} />
-                      <div style={{ flex:1, minWidth:0 }}>
-                        <div style={{ fontSize:14, fontWeight:700, color:isActive?"#fc3c44":"#fff", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{artistName}</div>
-                        <div style={{ fontSize:11, color:"#555", marginTop:2 }}>{albums.size} Album{albums.size!==1?"s":""} · {trackCount} Titel</div>
+                    <div key={artistName}
+                      style={{ display:"flex", alignItems:"center", padding:"10px 14px", gap:12, borderBottom:"1px solid #1a1a1a", background:isActive?"#0d0d0d":"transparent" }}>
+                      {/* Tappable artist avatar → set cover */}
+                      <div onClick={e => { e.stopPropagation(); artUploadCbRef.current = (b64) => setArtistCover(artistName, b64); extraArtInputRef.current?.click(); }}
+                        style={{ position:"relative", flexShrink:0, cursor:"pointer" }}>
+                        <TrackThumbnail art={cover} size={48} />
+                        <div style={{ position:"absolute", bottom:0, right:0, width:16, height:16, borderRadius:"50%", background:"#222", border:"1px solid #444", display:"flex", alignItems:"center", justifyContent:"center" }}>
+                          <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="#888" strokeWidth="2.5" strokeLinecap="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+                        </div>
                       </div>
-                      {isActive && <div style={{ fontSize:10, color:"#fc3c44", fontWeight:700 }}>▶</div>}
-                      <ChevronRight />
+                      <div onClick={() => setBrowseView(`artist:${artistName}`)} style={{ display:"flex", alignItems:"center", gap:12, flex:1, minWidth:0, cursor:"pointer" }}>
+                        <div style={{ flex:1, minWidth:0 }}>
+                          <div style={{ fontSize:14, fontWeight:700, color:isActive?"#fc3c44":"#fff", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{artistName}</div>
+                          <div style={{ fontSize:11, color:"#555", marginTop:2 }}>{albums.size} Album{albums.size!==1?"s":""} · {trackCount} Titel</div>
+                        </div>
+                        {isActive && <div style={{ fontSize:10, color:"#fc3c44", fontWeight:700 }}>▶</div>}
+                        <ChevronRight />
+                      </div>
                     </div>
                   );
                 })}
@@ -1690,14 +1690,18 @@ function MusicPlayer() {
                     }} />
                   </div>
 
-                  {/* Artist cover */}
-                  {artistCover && (
-                    <div style={{ padding:"14px 16px 0", flexShrink:0 }}>
-                      <div style={{ width:72, height:72, borderRadius:36, overflow:"hidden", border:"2px solid #222" }}>
-                        <img src={artistCover} style={{ width:"100%", height:"100%", objectFit:"cover" }} />
+                  {/* Artist cover — always shown, tappable to change */}
+                  <div style={{ padding:"14px 16px 0", flexShrink:0 }}>
+                    <div onClick={() => { artUploadCbRef.current = (b64) => setArtistCover(artistName, b64); extraArtInputRef.current?.click(); }}
+                      style={{ width:72, height:72, borderRadius:36, overflow:"hidden", border:"2px solid #222", background:"#181818", display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", position:"relative" }}>
+                      {artistCover
+                        ? <img src={artistCover} style={{ width:"100%", height:"100%", objectFit:"cover" }} />
+                        : <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#444" strokeWidth="1.5" strokeLinecap="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>}
+                      <div style={{ position:"absolute", bottom:2, right:2, width:18, height:18, borderRadius:"50%", background:"#222", border:"1px solid #444", display:"flex", alignItems:"center", justifyContent:"center" }}>
+                        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="#888" strokeWidth="2.5" strokeLinecap="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
                       </div>
                     </div>
-                  )}
+                  </div>
 
                   {/* Play all */}
                   <div style={{ padding:"12px 14px", flexShrink:0 }}>
@@ -1993,23 +1997,6 @@ function MusicPlayer() {
                 {headphoneOnly && headphonesDetected===null && (
                   <div style={{ marginTop:8, fontSize:11, color:"#555", lineHeight:1.6 }}>Auf iOS nicht verfügbar.</div>
                 )}
-
-                <Divider />
-
-                <div>
-                  <div style={{ fontSize:13, fontWeight:600, marginBottom:10 }}>Wiedergabegeschwindigkeit</div>
-                  <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
-                    {SPEEDS.map(s => (
-                      <button key={s} onClick={() => setPlaybackSpeed(s)}
-                        style={{ padding:"5px 10px", borderRadius:8, fontSize:12, fontWeight:600, cursor:"pointer",
-                          background:playbackSpeed===s?"#fc3c44":"#1e1e1e",
-                          color:playbackSpeed===s?"#fff":"#888",
-                          border:`1px solid ${playbackSpeed===s?"#fc3c44":"#2a2a2a"}` }}>
-                        {s===1?"1× (normal)":`${s}×`}
-                      </button>
-                    ))}
-                  </div>
-                </div>
 
                 <Divider />
 
